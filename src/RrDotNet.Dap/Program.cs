@@ -43,6 +43,7 @@ internal sealed class RrDotNetDebugAdapter(IDebugClient client) : IDebugAdapter,
 
     public async Task<LaunchResponse> LaunchAsync(LaunchRequestArguments args)
     {
+        AdapterLog.Write("launch requested");
         var trace = GetString(args.LaunchAttributes, "trace")
             ?? GetString(args.LaunchAttributes, "traceDir")
             ?? throw new InvalidOperationException("launch requires a 'trace' or 'traceDir' argument");
@@ -51,6 +52,7 @@ internal sealed class RrDotNetDebugAdapter(IDebugClient client) : IDebugAdapter,
         _session?.Dispose();
         _session = await RrInspectionSession.StartAsync(trace, replayEvent);
         BuildVariableHandles();
+        AdapterLog.Write($"launch loaded trace={trace} event={replayEvent} threads={_session.ManagedThreads.Count}");
 
         await client.ProcessStartedAsync(new ProcessEvent
         {
@@ -103,6 +105,7 @@ internal sealed class RrDotNetDebugAdapter(IDebugClient client) : IDebugAdapter,
 
     public async Task<TerminateResponse> TerminateAsync(TerminateArguments args)
     {
+        AdapterLog.Write("terminate requested");
         _session?.Dispose();
         _session = null;
         await client.DebuggerTerminatedAsync(new TerminatedEvent());
@@ -146,9 +149,10 @@ internal sealed class RrDotNetDebugAdapter(IDebugClient client) : IDebugAdapter,
     public Task<ThreadsResponse> GetThreadsAsync()
     {
         EnsureSession();
+        AdapterLog.Write($"threads requested count={_session!.ManagedThreads.Count}");
         return Task.FromResult(new ThreadsResponse
         {
-            Threads = _session!.ManagedThreads
+            Threads = _session.ManagedThreads
                 .Select(t => new Thread { Id = t.Id, Name = t.Name })
                 .ToArray(),
         });
@@ -157,6 +161,7 @@ internal sealed class RrDotNetDebugAdapter(IDebugClient client) : IDebugAdapter,
     public Task<StackTraceResponse> GetStackTraceAsync(StackTraceArguments args)
     {
         EnsureSession();
+        AdapterLog.Write($"stackTrace requested thread={args.ThreadId}");
         var thread = _session!.ManagedThreads.FirstOrDefault(t => t.Id == args.ThreadId);
         var managedFrames = _session.GetStackFrames(args.ThreadId);
         DapStackFrame[] frames;
@@ -251,6 +256,7 @@ internal sealed class RrDotNetDebugAdapter(IDebugClient client) : IDebugAdapter,
 
     public void Dispose()
     {
+        AdapterLog.Write("adapter disposed");
         _session?.Dispose();
     }
 
@@ -1174,6 +1180,26 @@ internal sealed class RrGdbDataReader : IDataReader, IDisposable
 internal readonly record struct Mapping(ulong Start, ulong End, ulong Offset, string Perms, string FileName)
 {
     public ulong Size => End - Start;
+}
+
+internal static class AdapterLog
+{
+    private static readonly object Gate = new();
+    private static readonly string Path = System.IO.Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        ".cache",
+        "rr-dotnet-dap.log");
+
+    public static void Write(string message)
+    {
+        lock (Gate)
+        {
+            Directory.CreateDirectory(System.IO.Path.GetDirectoryName(Path)!);
+            File.AppendAllText(
+                Path,
+                $"{DateTimeOffset.Now:O} {message}{Environment.NewLine}");
+        }
+    }
 }
 
 internal sealed class StreamDuplexPipe(Stream input, Stream output) : IDuplexPipe
