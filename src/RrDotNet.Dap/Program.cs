@@ -33,7 +33,9 @@ internal interface IRrDotNetCapabilities
 
 internal sealed class RrDotNetDebugAdapter(IDebugClient client) : IDebugAdapter, IRrDotNetCapabilities
 {
+    private const int SnapshotVariablesReference = 1;
     private readonly Dictionary<int, IReadOnlyList<Variable>> _variables = [];
+    private readonly Dictionary<int, int> _frameVariableReferences = [];
     private RrInspectionSession? _session;
     private int _nextVariablesReference = 1;
 
@@ -156,36 +158,77 @@ internal sealed class RrDotNetDebugAdapter(IDebugClient client) : IDebugAdapter,
     {
         EnsureSession();
         var thread = _session!.ManagedThreads.FirstOrDefault(t => t.Id == args.ThreadId);
-        var frame = new DapStackFrame
+        var managedFrames = _session.GetStackFrames(args.ThreadId);
+        DapStackFrame[] frames;
+        if (managedFrames.Count > 0)
         {
-            Id = args.ThreadId,
-            Name = thread is null ? "rr replay snapshot" : $"managed thread {thread.ManagedThreadId}",
-            Line = 1,
-            Column = 1,
-            PresentationHint = DapStackFrame.StackPresentationHint.Label,
-        };
+            frames = managedFrames.Select((f, index) => new DapStackFrame
+            {
+                Id = unchecked(args.ThreadId * 1000 + index),
+                Name = f.Name,
+                Line = 1,
+                Column = 1,
+                InstructionPointerReference = $"0x{f.InstructionPointer:x16}",
+                PresentationHint = DapStackFrame.StackPresentationHint.Normal,
+            }).ToArray();
+            foreach (var (frame, info) in frames.Zip(managedFrames))
+            {
+                _frameVariableReferences[frame.Id] = AddVariables(
+                [
+                    Scalar("method", info.Name, "string"),
+                    Scalar("instructionPointer", $"0x{info.InstructionPointer:x16}", "address"),
+                    Scalar("stackPointer", $"0x{info.StackPointer:x16}", "address"),
+                    Scalar("locals", "not implemented yet: needs managed local-variable inspection on top of the CLRMD stack frame", "status"),
+                ]);
+            }
+        }
+        else
+        {
+            frames =
+            [
+                new DapStackFrame
+                {
+                    Id = args.ThreadId,
+                    Name = thread is null ? "rr replay snapshot" : $"managed thread {thread.ManagedThreadId}",
+                    Line = 1,
+                    Column = 1,
+                    PresentationHint = DapStackFrame.StackPresentationHint.Label,
+                },
+            ];
+        }
+
         return Task.FromResult(new StackTraceResponse
         {
-            StackFrames = [frame],
-            TotalFrames = 1,
+            StackFrames = frames,
+            TotalFrames = frames.Length,
         });
     }
 
     public Task<ScopesResponse> GetScopesAsync(ScopesArguments args)
     {
         EnsureSession();
+        var scopes = new List<Scope>();
+        if (_frameVariableReferences.TryGetValue(args.FrameId, out var frameVariablesReference))
+        {
+            scopes.Add(new Scope
+            {
+                Name = "Frame",
+                VariablesReference = frameVariablesReference,
+                Expensive = false,
+                PresentationHint = Scope.ScopePresentationHint.Locals,
+            });
+        }
+
+        scopes.Add(new Scope
+        {
+            Name = "rr / CLRMD snapshot",
+            VariablesReference = SnapshotVariablesReference,
+            Expensive = false,
+        });
+
         return Task.FromResult(new ScopesResponse
         {
-            Scopes =
-            [
-                new Scope
-                {
-                    Name = "rr / CLRMD snapshot",
-                    VariablesReference = 1,
-                    Expensive = false,
-                    PresentationHint = Scope.ScopePresentationHint.Locals,
-                },
-            ],
+            Scopes = scopes.ToArray(),
         });
     }
 
@@ -215,6 +258,7 @@ internal sealed class RrDotNetDebugAdapter(IDebugClient client) : IDebugAdapter,
     {
         EnsureSession();
         _variables.Clear();
+        _frameVariableReferences.Clear();
         _nextVariablesReference = 2;
 
         var root = new List<Variable>
@@ -237,7 +281,7 @@ internal sealed class RrDotNetDebugAdapter(IDebugClient client) : IDebugAdapter,
             NamedVariables = _session.InterestingModules.Count,
         });
 
-        _variables[1] = root;
+        _variables[SnapshotVariablesReference] = root;
     }
 
     private int AddVariables(IEnumerable<Variable> variables)
@@ -314,10 +358,12 @@ internal sealed class RrInspectionSession : IDisposable
         ClrVersionCount = target.ClrVersions.Length;
         HeapCanWalk = runtime?.Heap.CanWalkHeap ?? false;
         SystemStringMethodTable = runtime?.Heap.GetTypeByName("System.String")?.MethodTable ?? 0;
-        ManagedThreads = runtime?.Threads.Select((t, i) => new ManagedThreadInfo(
-            Id: t.OSThreadId == 0 ? i + 1 : checked((int)t.OSThreadId),
-            ManagedThreadId: checked((ulong)t.ManagedThreadId),
-            Name: $"managed {t.ManagedThreadId} / os 0x{t.OSThreadId:x}")).ToArray() ?? [];
+        ManagedThreads = runtime?.Threads.Select((t, i) =>
+            new ManagedThreadInfo(
+                Id: t.OSThreadId == 0 ? i + 1 : checked((int)t.OSThreadId),
+                ManagedThreadId: checked((ulong)t.ManagedThreadId),
+                OSThreadId: t.OSThreadId,
+                Name: $"managed {t.ManagedThreadId} / os 0x{t.OSThreadId:x}")).ToArray() ?? [];
     }
 
     public string TracePath { get; }
@@ -349,6 +395,30 @@ internal sealed class RrInspectionSession : IDisposable
         return new RrInspectionSession(tracePath, replayEvent, rr, gdb, reader, target, runtime);
     }
 
+    public IReadOnlyList<ManagedStackFrameInfo> GetStackFrames(int threadId)
+    {
+        var thread = _runtime?.Threads.FirstOrDefault(t => (t.OSThreadId == 0 ? checked((int)t.ManagedThreadId) : checked((int)t.OSThreadId)) == threadId);
+        if (thread is null)
+        {
+            return [];
+        }
+
+        try
+        {
+            return thread.EnumerateStackTrace()
+                .Take(64)
+                .Select(f => new ManagedStackFrameInfo(
+                    Name: f.ToString() ?? "<unknown managed frame>",
+                    InstructionPointer: f.InstructionPointer,
+                    StackPointer: f.StackPointer))
+                .ToArray();
+        }
+        catch
+        {
+            return [];
+        }
+    }
+
     public void Dispose()
     {
         _runtime?.Dispose();
@@ -368,7 +438,9 @@ internal sealed class RrInspectionSession : IDisposable
     }
 }
 
-internal sealed record ManagedThreadInfo(int Id, ulong ManagedThreadId, string Name);
+internal sealed record ManagedThreadInfo(int Id, ulong ManagedThreadId, uint OSThreadId, string Name);
+
+internal sealed record ManagedStackFrameInfo(string Name, ulong InstructionPointer, ulong StackPointer);
 
 internal sealed class RrReplaySession : IDisposable
 {
@@ -489,6 +561,7 @@ internal sealed class GdbMiClient : IDisposable
 {
     private readonly Process _process;
     private readonly BlockingCollection<string> _lines = [];
+    private readonly SemaphoreSlim _commandLock = new(1, 1);
     private int _token;
 
     private GdbMiClient(Process process)
@@ -528,6 +601,8 @@ internal sealed class GdbMiClient : IDisposable
         return await CommandAsync($"-interpreter-exec console \"{escaped}\"");
     }
 
+    public async Task<string> RawCommandAsync(string command) => await CommandAsync(command);
+
     public async Task<byte[]> ReadMemoryAsync(ulong address, int count)
     {
         var result = await CommandAsync($"-data-read-memory-bytes 0x{address:x} {count}");
@@ -537,22 +612,37 @@ internal sealed class GdbMiClient : IDisposable
 
     public async Task<string> CommandAsync(string command)
     {
-        var token = Interlocked.Increment(ref _token);
-        await _process.StandardInput.WriteLineAsync($"{token}{command}");
-        await _process.StandardInput.FlushAsync();
-
-        var builder = new StringBuilder();
-        while (true)
+        await _commandLock.WaitAsync();
+        try
         {
-            var line = _lines.Take();
-            builder.AppendLine(line);
-            if (line.StartsWith($"{token}^done", StringComparison.Ordinal)
-                || line.StartsWith($"{token}^error", StringComparison.Ordinal)
-                || line.StartsWith($"{token}^connected", StringComparison.Ordinal))
+            var token = Interlocked.Increment(ref _token);
+            await _process.StandardInput.WriteLineAsync($"{token}{command}");
+            await _process.StandardInput.FlushAsync();
+
+            var builder = new StringBuilder();
+            var timeout = DateTime.UtcNow.AddSeconds(10);
+            while (DateTime.UtcNow < timeout)
             {
-                await WaitForPromptAsync();
-                return builder.ToString();
+                if (!TryTakeLine(timeout, out var line))
+                {
+                    continue;
+                }
+
+                builder.AppendLine(line);
+                if (line.StartsWith($"{token}^done", StringComparison.Ordinal)
+                    || line.StartsWith($"{token}^error", StringComparison.Ordinal)
+                    || line.StartsWith($"{token}^connected", StringComparison.Ordinal))
+                {
+                    await WaitForPromptAsync();
+                    return builder.ToString();
+                }
             }
+
+            throw new TimeoutException($"gdb/mi command timed out: {command}");
+        }
+        finally
+        {
+            _commandLock.Release();
         }
     }
 
@@ -576,10 +666,24 @@ internal sealed class GdbMiClient : IDisposable
 
     private Task WaitForPromptAsync()
     {
-        while (true)
+        var timeout = DateTime.UtcNow.AddSeconds(10);
+        while (DateTime.UtcNow < timeout)
         {
-            if (_lines.Take() == "(gdb)") return Task.CompletedTask;
+            if (TryTakeLine(timeout, out var line) && line == "(gdb)") return Task.CompletedTask;
         }
+        throw new TimeoutException("timed out waiting for gdb prompt");
+    }
+
+    private bool TryTakeLine(DateTime timeout, out string line)
+    {
+        var remaining = timeout - DateTime.UtcNow;
+        if (remaining <= TimeSpan.Zero)
+        {
+            line = "";
+            return false;
+        }
+
+        return _lines.TryTake(out line!, remaining < TimeSpan.FromMilliseconds(250) ? remaining : TimeSpan.FromMilliseconds(250));
     }
 
     private async Task ReadOutputLoop()
@@ -626,14 +730,17 @@ internal sealed class GdbMiClient : IDisposable
 
 internal sealed class RrGdbDataReader : IDataReader, IDisposable
 {
+    private const int PageSize = 4096;
     private readonly GdbMiClient _gdb;
     private readonly Dictionary<(ulong Address, int Size), byte[]> _memoryCache = [];
+    private readonly Dictionary<uint, int> _gdbThreadsByOsThread = [];
 
     public RrGdbDataReader(GdbMiClient gdb, int processId)
     {
         _gdb = gdb;
         ProcessId = processId;
         Mappings = LoadMappingsAsync().GetAwaiter().GetResult();
+        _gdbThreadsByOsThread = LoadThreadMapAsync().GetAwaiter().GetResult();
         Modules = LoadModules();
     }
 
@@ -647,28 +754,62 @@ internal sealed class RrGdbDataReader : IDataReader, IDisposable
     public IReadOnlyList<Mapping> Mappings { get; }
 
     public IEnumerable<ModuleInfo> EnumerateModules() => Modules;
-    public bool GetThreadContext(uint threadID, uint contextFlags, Span<byte> context) => false;
+    public bool GetThreadContext(uint threadID, uint contextFlags, Span<byte> context)
+    {
+        if (context.Length < AMD64Context.Size || !_gdbThreadsByOsThread.TryGetValue(threadID, out var gdbThreadId))
+        {
+            return false;
+        }
+
+        try
+        {
+            _gdb.RawCommandAsync($"-thread-select {gdbThreadId}").GetAwaiter().GetResult();
+            var registers = LoadRegistersAsync().GetAwaiter().GetResult();
+            WriteAmd64Context(context, registers);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
     public void FlushCachedData() => _memoryCache.Clear();
 
     public int Read(ulong address, Span<byte> buffer)
     {
         if (buffer.Length == 0) return 0;
-        try
+        var total = 0;
+        while (total < buffer.Length)
         {
-            var key = (address, buffer.Length);
-            if (!_memoryCache.TryGetValue(key, out var data))
+            var current = address + checked((ulong)total);
+            var pageStart = current & ~(ulong)(PageSize - 1);
+            var pageOffset = checked((int)(current - pageStart));
+            byte[] page;
+            try
             {
-                data = _gdb.ReadMemoryAsync(address, buffer.Length).GetAwaiter().GetResult();
-                _memoryCache[key] = data;
+                var key = (pageStart, PageSize);
+                if (!_memoryCache.TryGetValue(key, out page!))
+                {
+                    page = _gdb.ReadMemoryAsync(pageStart, PageSize).GetAwaiter().GetResult();
+                    _memoryCache[key] = page;
+                }
             }
-            var count = Math.Min(buffer.Length, data.Length);
-            data.AsSpan(0, count).CopyTo(buffer);
-            return count;
+            catch
+            {
+                return total;
+            }
+
+            if (pageOffset >= page.Length)
+            {
+                return total;
+            }
+
+            var count = Math.Min(buffer.Length - total, page.Length - pageOffset);
+            page.AsSpan(pageOffset, count).CopyTo(buffer[total..]);
+            total += count;
         }
-        catch
-        {
-            return 0;
-        }
+
+        return total;
     }
 
     public bool Read<T>(ulong address, out T value) where T : unmanaged
@@ -702,6 +843,90 @@ internal sealed class RrGdbDataReader : IDataReader, IDisposable
             if (module is not null) modules.Add(module);
         }
         return modules.OrderBy(m => m.ImageBase).ToArray();
+    }
+
+    private async Task<Dictionary<uint, int>> LoadThreadMapAsync()
+    {
+        var result = await _gdb.RawCommandAsync("-thread-info");
+        var map = new Dictionary<uint, int>();
+
+        foreach (var thread in ExtractThreadObjects(result))
+        {
+            if (!TryReadMiInt(thread, "id", out var gdbId))
+            {
+                continue;
+            }
+
+            var targetId = TryReadMiString(thread, "target-id") ?? "";
+            var match = System.Text.RegularExpressions.Regex.Match(targetId, @"Thread\s+\d+\.(\d+)");
+            if (match.Success && uint.TryParse(match.Groups[1].Value, CultureInfo.InvariantCulture, out var osThreadId))
+            {
+                map[osThreadId] = gdbId;
+            }
+        }
+
+        return map;
+    }
+
+    private async Task<Dictionary<string, ulong>> LoadRegistersAsync()
+    {
+        var result = await _gdb.RawCommandAsync("-data-list-register-values x");
+        var registers = new Dictionary<string, ulong>(StringComparer.OrdinalIgnoreCase);
+        foreach (var item in ExtractRegisterObjects(result))
+        {
+            if (!TryReadMiInt(item, "number", out var number))
+            {
+                continue;
+            }
+
+            var value = TryReadMiString(item, "value");
+            if (value is null)
+            {
+                continue;
+            }
+
+            var name = RegisterName(number);
+            if (name is not null && TryParseRegisterValue(value, out var parsed))
+            {
+                registers[name] = parsed;
+            }
+        }
+
+        return registers;
+    }
+
+    private static void WriteAmd64Context(Span<byte> context, IReadOnlyDictionary<string, ulong> registers)
+    {
+        context.Clear();
+        ref var amd64 = ref MemoryMarshal.AsRef<AMD64Context>(context);
+        amd64.ContextFlags = AMD64Context.ContextControl | AMD64Context.ContextInteger | AMD64Context.ContextSegments;
+        amd64.Rax = Get(registers, "rax");
+        amd64.Rcx = Get(registers, "rcx");
+        amd64.Rdx = Get(registers, "rdx");
+        amd64.Rbx = Get(registers, "rbx");
+        amd64.Rsp = Get(registers, "rsp");
+        amd64.Rbp = Get(registers, "rbp");
+        amd64.Rsi = Get(registers, "rsi");
+        amd64.Rdi = Get(registers, "rdi");
+        amd64.R8 = Get(registers, "r8");
+        amd64.R9 = Get(registers, "r9");
+        amd64.R10 = Get(registers, "r10");
+        amd64.R11 = Get(registers, "r11");
+        amd64.R12 = Get(registers, "r12");
+        amd64.R13 = Get(registers, "r13");
+        amd64.R14 = Get(registers, "r14");
+        amd64.R15 = Get(registers, "r15");
+        amd64.Rip = Get(registers, "rip");
+        amd64.EFlags = unchecked((int)Get(registers, "eflags"));
+        amd64.Cs = checked((ushort)Get(registers, "cs"));
+        amd64.Ss = checked((ushort)Get(registers, "ss"));
+        amd64.Ds = checked((ushort)Get(registers, "ds"));
+        amd64.Es = checked((ushort)Get(registers, "es"));
+        amd64.Fs = checked((ushort)Get(registers, "fs"));
+        amd64.Gs = checked((ushort)Get(registers, "gs"));
+
+        static ulong Get(IReadOnlyDictionary<string, ulong> values, string name)
+            => values.TryGetValue(name, out var value) ? value : 0;
     }
 
     private async Task<IReadOnlyList<Mapping>> LoadMappingsAsync()
@@ -754,6 +979,196 @@ internal sealed class RrGdbDataReader : IDataReader, IDisposable
         }
         return builder.ToString();
     }
+
+    private static IEnumerable<string> ExtractThreadObjects(string mi)
+    {
+        var marker = "threads=[";
+        var start = mi.IndexOf(marker, StringComparison.Ordinal);
+        if (start < 0)
+        {
+            yield break;
+        }
+
+        start += marker.Length;
+        var end = FindMatching(mi, start - 1, '[', ']');
+        if (end < 0)
+        {
+            yield break;
+        }
+
+        foreach (var item in ExtractTopLevelObjects(mi[start..end]))
+        {
+            yield return item;
+        }
+    }
+
+    private static IEnumerable<string> ExtractRegisterObjects(string mi)
+    {
+        var marker = "register-values=[";
+        var start = mi.IndexOf(marker, StringComparison.Ordinal);
+        if (start < 0)
+        {
+            yield break;
+        }
+
+        start += marker.Length;
+        var end = FindMatching(mi, start - 1, '[', ']');
+        if (end < 0)
+        {
+            yield break;
+        }
+
+        foreach (var item in ExtractTopLevelObjects(mi[start..end]))
+        {
+            yield return item;
+        }
+    }
+
+    private static IEnumerable<string> ExtractTopLevelObjects(string text)
+    {
+        for (var i = 0; i < text.Length; i++)
+        {
+            if (text[i] != '{')
+            {
+                continue;
+            }
+
+            var end = FindMatching(text, i, '{', '}');
+            if (end < 0)
+            {
+                yield break;
+            }
+
+            yield return text[i..(end + 1)];
+            i = end;
+        }
+    }
+
+    private static int FindMatching(string text, int openIndex, char open, char close)
+    {
+        var depth = 0;
+        var inString = false;
+        var escaped = false;
+
+        for (var i = openIndex; i < text.Length; i++)
+        {
+            var ch = text[i];
+            if (inString)
+            {
+                if (escaped)
+                {
+                    escaped = false;
+                }
+                else if (ch == '\\')
+                {
+                    escaped = true;
+                }
+                else if (ch == '"')
+                {
+                    inString = false;
+                }
+
+                continue;
+            }
+
+            if (ch == '"')
+            {
+                inString = true;
+            }
+            else if (ch == open)
+            {
+                depth++;
+            }
+            else if (ch == close && --depth == 0)
+            {
+                return i;
+            }
+        }
+
+        return -1;
+    }
+
+    private static bool TryReadMiInt(string obj, string key, out int value)
+    {
+        var text = TryReadMiString(obj, key);
+        return int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out value);
+    }
+
+    private static string? TryReadMiString(string obj, string key)
+    {
+        var marker = $"{key}=\"";
+        var start = obj.IndexOf(marker, StringComparison.Ordinal);
+        if (start < 0)
+        {
+            return null;
+        }
+
+        start += marker.Length;
+        var builder = new StringBuilder();
+        var escaped = false;
+        for (var i = start; i < obj.Length; i++)
+        {
+            var ch = obj[i];
+            if (escaped)
+            {
+                builder.Append(ch);
+                escaped = false;
+            }
+            else if (ch == '\\')
+            {
+                escaped = true;
+            }
+            else if (ch == '"')
+            {
+                return builder.ToString();
+            }
+            else
+            {
+                builder.Append(ch);
+            }
+        }
+
+        return null;
+    }
+
+    private static bool TryParseRegisterValue(string value, out ulong parsed)
+    {
+        if (value.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+        {
+            return ulong.TryParse(value[2..], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out parsed);
+        }
+
+        return ulong.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out parsed);
+    }
+
+    private static string? RegisterName(int number) => number switch
+    {
+        0 => "rax",
+        1 => "rbx",
+        2 => "rcx",
+        3 => "rdx",
+        4 => "rsi",
+        5 => "rdi",
+        6 => "rbp",
+        7 => "rsp",
+        8 => "r8",
+        9 => "r9",
+        10 => "r10",
+        11 => "r11",
+        12 => "r12",
+        13 => "r13",
+        14 => "r14",
+        15 => "r15",
+        16 => "rip",
+        17 => "eflags",
+        18 => "cs",
+        19 => "ss",
+        20 => "ds",
+        21 => "es",
+        22 => "fs",
+        23 => "gs",
+        _ => null,
+    };
 }
 
 internal readonly record struct Mapping(ulong Start, ulong End, ulong Offset, string Perms, string FileName)

@@ -58,8 +58,9 @@ Current proof points:
 
 Current limitations:
 
-- `GetThreadContext` is not implemented yet, so managed stack walking is the next missing piece.
-- Memory reads go through GDB/MI and are not optimized for broad heap scans.
+- Stack walking depends on GDB register reads for the rr replay thread context.
+- Managed local variables are not implemented yet. The DAP currently exposes frame metadata, not CLR local-variable values.
+- Memory reads go through GDB/MI and are page-cached, but are still not optimized for broad heap scans.
 
 ## DAP adapter
 
@@ -92,14 +93,44 @@ Current DAP support:
 - `initialize`
 - `launch` / `attach`
 - `threads`
-- `stackTrace` with a synthetic frame per thread
+- `stackTrace` with best-effort managed frames from CLRMD
 - `scopes`
-- `variables` with trace/runtime/module summary
+- `variables` with trace/runtime/module summary and per-frame method/IP/SP metadata
 - `setBreakpoints` returns unverified placeholders
 - `stepIn`, `next`, and `stepOut` acknowledge without moving the rr event
 - `terminate`
 
-The adapter is currently a snapshot inspector, not an execution-control debugger. The next important step is implementing thread contexts and managed stack frames, then wiring rr event movement for continue/step/reverse-step.
+The adapter is currently a snapshot inspector, not an execution-control debugger. The next important steps are managed local-variable inspection and wiring rr event movement for continue/step/reverse-step.
+
+## VS Code extension
+
+The local debugger contribution lives in `vscode-extension/rr-dotnet`.
+
+For this workstation it has also been installed into:
+
+```text
+/home/kuinox/.vscode/extensions/kuinox.rr-dotnet-0.0.1
+```
+
+If VS Code still says the `rr-dotnet` debug type is unsupported, refresh that install:
+
+```bash
+mkdir -p /home/kuinox/.vscode/extensions/kuinox.rr-dotnet-0.0.1
+cp vscode-extension/rr-dotnet/package.json \
+  /home/kuinox/.vscode/extensions/kuinox.rr-dotnet-0.0.1/package.json
+```
+
+Then reload VS Code and use a launch config like:
+
+```json
+{
+  "name": "rr .NET snapshot",
+  "type": "rr-dotnet",
+  "request": "launch",
+  "trace": "/home/kuinox/.local/share/rr/dotnet-5",
+  "event": "5000"
+}
+```
 
 Useful manual landmarks in the sample:
 

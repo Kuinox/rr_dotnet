@@ -1,0 +1,66 @@
+{
+  "name": "rr-dotnet",
+  "displayName": "rr .NET Debug Adapter",
+  "description": "Local debug adapter registration for rr_dotnet.",
+  "version": "0.0.1",
+  "publisher": "kuinox",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Debuggers"
+  ],
+  "contributes": {
+    "debuggers": [
+      {
+        "type": "rr-dotnet",
+        "label": "rr .NET",
+        "runtime": "dotnet",
+        "program": "${workspaceFolder}/../rr_dotnet/src/RrDotNet.Dap/bin/Debug/net10.0/RrDotNet.Dap.dll",
+        "configurationAttributes": {
+          "launch": {
+            "required": [
+              "trace"
+            ],
+            "properties": {
+              "trace": {
+                "type": "string",
+                "description": "Path to the rr trace directory."
+              },
+              "event": {
+                "type": "string",
+                "default": "5000",
+                "description": "rr event number where replay should stop."
+              }
+            }
+          },
+          "attach": {
+            "required": [
+              "trace"
+            ],
+            "properties": {
+              "trace": {
+                "type": "string",
+                "description": "Path to the rr trace directory."
+              },
+              "event": {
+                "type": "string",
+                "default": "5000",
+                "description": "rr event number where replay should stop."
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "name": "rr .NET snapshot",
+            "type": "rr-dotnet",
+            "request": "launch",
+            "trace": "/home/kuinox/.local/share/rr/dotnet-5",
+            "event": "5000"
+          }
+        ]
+      }
+    ]
+  }
+}
