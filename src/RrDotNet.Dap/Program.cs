@@ -31,7 +31,16 @@ internal interface IRrDotNetCapabilities
     bool SupportsModulesRequest => false;
 }
 
-internal sealed class RrDotNetDebugAdapter(IDebugClient client) : IDebugAdapter, IRrDotNetCapabilities
+internal interface IRrDotNetReverseExecution
+{
+    [Request("stepBack")]
+    Task<StepBackResponse> StepBackAsync(StepBackArguments args);
+
+    [Request("reverseContinue")]
+    Task<ReverseContinueResponse> ReverseContinueAsync(ReverseContinueArguments args);
+}
+
+internal sealed class RrDotNetDebugAdapter(IDebugClient client) : IDebugAdapter, IRrDotNetCapabilities, IRrDotNetReverseExecution
 {
     private const int SnapshotVariablesReference = 1;
     private readonly Dictionary<int, IReadOnlyList<Variable>> _variables = [];
@@ -87,7 +96,8 @@ internal sealed class RrDotNetDebugAdapter(IDebugClient client) : IDebugAdapter,
 
     public async Task<ContinueResponse> ContinueAsync(ContinueArguments args)
     {
-        await client.TerminatedDebuggerAsync();
+        EnsureSession();
+        await ExecuteAsync("-exec-continue", StoppedEvent.StoppedReason.Breakpoint, args.ThreadId);
         return new ContinueResponse { AllThreadsContinued = true };
     }
 
@@ -114,20 +124,32 @@ internal sealed class RrDotNetDebugAdapter(IDebugClient client) : IDebugAdapter,
 
     public async Task<StepInResponse> StepIntoAsync(StepInArguments args)
     {
-        await SendStepStoppedAsync(args.ThreadId);
+        await ExecuteAsync("-exec-step-instruction", StoppedEvent.StoppedReason.Step, args.ThreadId);
         return new StepInResponse();
     }
 
     public async Task<NextResponse> StepOverAsync(NextArguments args)
     {
-        await SendStepStoppedAsync(args.ThreadId);
+        await ExecuteAsync("-exec-next-instruction", StoppedEvent.StoppedReason.Step, args.ThreadId, "-exec-step-instruction");
         return new NextResponse();
     }
 
     public async Task<StepOutResponse> StepOutAsync(StepOutArguments args)
     {
-        await SendStepStoppedAsync(args.ThreadId);
+        await ExecuteAsync("-exec-finish", StoppedEvent.StoppedReason.Step, args.ThreadId, "-exec-step");
         return new StepOutResponse();
+    }
+
+    public async Task<StepBackResponse> StepBackAsync(StepBackArguments args)
+    {
+        await ExecuteAsync("-exec-step-instruction --reverse", StoppedEvent.StoppedReason.Step, args.ThreadId);
+        return new StepBackResponse();
+    }
+
+    public async Task<ReverseContinueResponse> ReverseContinueAsync(ReverseContinueArguments args)
+    {
+        await ExecuteAsync("-exec-continue --reverse", StoppedEvent.StoppedReason.Breakpoint, args.ThreadId);
+        return new ReverseContinueResponse();
     }
 
     public Task<SetBreakpointsResponse> SetBreakpointsAsync(SetBreakpointsArguments args)
@@ -181,9 +203,16 @@ internal sealed class RrDotNetDebugAdapter(IDebugClient client) : IDebugAdapter,
                 _frameVariableReferences[frame.Id] = AddVariables(
                 [
                     Scalar("method", info.Name, "string"),
+                    Scalar("kind", info.Kind, "ClrStackFrameKind"),
                     Scalar("instructionPointer", $"0x{info.InstructionPointer:x16}", "address"),
                     Scalar("stackPointer", $"0x{info.StackPointer:x16}", "address"),
-                    Scalar("locals", "not implemented yet: needs managed local-variable inspection on top of the CLRMD stack frame", "status"),
+                    Scalar("methodDesc", info.MethodDesc == 0 ? "0x0" : $"0x{info.MethodDesc:x16}", "address"),
+                    Scalar("metadataToken", info.MetadataToken == 0 ? "0" : $"0x{info.MetadataToken:x8}", "int"),
+                    WithChildren(
+                        "stackRoots",
+                        $"{info.StackRoots.Count} GC roots reported for this frame",
+                        "ClrStackRoot[]",
+                        info.StackRoots.Select((r, rootIndex) => RootVariable(rootIndex, r))),
                 ]);
             }
         }
@@ -305,18 +334,60 @@ internal sealed class RrDotNetDebugAdapter(IDebugClient client) : IDebugAdapter,
         VariablesReference = 0,
     };
 
-    private async Task SendStepStoppedAsync(int? threadId)
+    private async Task ExecuteAsync(string command, StoppedEvent.StoppedReason stoppedReason, int? threadId, string? fallbackCommand = null)
     {
         EnsureSession();
+        AdapterLog.Write($"exec requested command={command} thread={threadId}");
+        ExecutionResult result;
+        try
+        {
+            result = await _session!.ExecuteAsync(command, threadId);
+        }
+        catch (InvalidOperationException) when (fallbackCommand is not null)
+        {
+            AdapterLog.Write($"exec fallback command={fallbackCommand} thread={threadId}");
+            result = await _session!.ExecuteAsync(fallbackCommand, threadId);
+        }
+        BuildVariableHandles();
+
+        if (result.Exited)
+        {
+            await client.ProcessExitedAsync(new ExitedEvent { ExitCode = result.ExitCode ?? 0 });
+            await client.DebuggerTerminatedAsync(new TerminatedEvent());
+            return;
+        }
+
         await client.StoppedAsync(new StoppedEvent
         {
-            Reason = StoppedEvent.StoppedReason.Step,
-            Description = "execution control is not implemented yet",
-            Text = "rr snapshot adapter: step request acknowledged without changing replay event",
+            Reason = result.HitBreakpoint ? StoppedEvent.StoppedReason.Breakpoint : stoppedReason,
+            Description = result.Description,
             AllThreadsStopped = true,
-            ThreadId = threadId ?? _session!.ManagedThreads.FirstOrDefault()?.Id,
+            ThreadId = result.ThreadId ?? threadId ?? _session.ManagedThreads.FirstOrDefault()?.Id,
         });
     }
+
+    private Variable WithChildren(string name, string value, string type, IEnumerable<Variable> children)
+    {
+        var items = children.ToArray();
+        return new Variable
+        {
+            Name = name,
+            Value = value,
+            Type = type,
+            VariablesReference = AddVariables(items),
+            NamedVariables = items.Length,
+        };
+    }
+
+    private Variable RootVariable(int index, ManagedStackRootInfo root)
+    {
+        var name = root.RegisterName is { Length: > 0 }
+            ? $"{root.RegisterName}{(root.RegisterOffset == 0 ? "" : root.RegisterOffset.ToString(CultureInfo.InvariantCulture))}"
+            : $"root_{index}";
+        return WithChildren(name, root.DisplayValue, root.TypeName, root.Fields.Select(FieldVariable));
+    }
+
+    private static Variable FieldVariable(ManagedObjectFieldInfo field) => Scalar(field.Name, field.Value, field.TypeName);
 
     private void EnsureSession()
     {
@@ -340,8 +411,8 @@ internal sealed class RrInspectionSession : IDisposable
 {
     private readonly RrReplaySession _rr;
     private readonly GdbMiClient _gdb;
-    private readonly DataTarget _target;
-    private readonly ClrRuntime? _runtime;
+    private DataTarget _target;
+    private ClrRuntime? _runtime;
 
     private RrInspectionSession(
         string tracePath,
@@ -361,15 +432,7 @@ internal sealed class RrInspectionSession : IDisposable
         _runtime = runtime;
         ProcessId = rr.RecordedProcessId;
         InterestingModules = reader.Modules.Where(m => IsInterestingModule(m.FileName)).ToArray();
-        ClrVersionCount = target.ClrVersions.Length;
-        HeapCanWalk = runtime?.Heap.CanWalkHeap ?? false;
-        SystemStringMethodTable = runtime?.Heap.GetTypeByName("System.String")?.MethodTable ?? 0;
-        ManagedThreads = runtime?.Threads.Select((t, i) =>
-            new ManagedThreadInfo(
-                Id: t.OSThreadId == 0 ? i + 1 : checked((int)t.OSThreadId),
-                ManagedThreadId: checked((ulong)t.ManagedThreadId),
-                OSThreadId: t.OSThreadId,
-                Name: $"managed {t.ManagedThreadId} / os 0x{t.OSThreadId:x}")).ToArray() ?? [];
+        RefreshRuntimeSummary();
     }
 
     public string TracePath { get; }
@@ -377,10 +440,10 @@ internal sealed class RrInspectionSession : IDisposable
     public int ProcessId { get; }
     public RrGdbDataReader Reader { get; }
     public IReadOnlyList<ModuleInfo> InterestingModules { get; }
-    public int ClrVersionCount { get; }
-    public bool HeapCanWalk { get; }
-    public ulong SystemStringMethodTable { get; }
-    public IReadOnlyList<ManagedThreadInfo> ManagedThreads { get; }
+    public int ClrVersionCount { get; private set; }
+    public bool HeapCanWalk { get; private set; }
+    public ulong SystemStringMethodTable { get; private set; }
+    public IReadOnlyList<ManagedThreadInfo> ManagedThreads { get; private set; } = [];
 
     public static async Task<RrInspectionSession> StartAsync(string tracePath, string replayEvent)
     {
@@ -388,15 +451,7 @@ internal sealed class RrInspectionSession : IDisposable
         var gdb = await GdbMiClient.ConnectAsync(rr.ExecutablePath, rr.Port);
         var reader = new RrGdbDataReader(gdb, rr.RecordedProcessId);
         var target = new DataTarget(reader, new DataTargetOptions());
-        ClrRuntime? runtime = null;
-
-        if (target.ClrVersions.Length > 0)
-        {
-            var clr = target.ClrVersions[0];
-            var dacPath = clr.DebuggingLibraries.Select(l => l.FileName).FirstOrDefault(File.Exists)
-                ?? "/usr/share/dotnet/shared/Microsoft.NETCore.App/10.0.8/libmscordaccore.so";
-            runtime = clr.CreateRuntime(dacPath, ignoreMismatch: true);
-        }
+        var runtime = CreateRuntime(target);
 
         return new RrInspectionSession(tracePath, replayEvent, rr, gdb, reader, target, runtime);
     }
@@ -411,18 +466,184 @@ internal sealed class RrInspectionSession : IDisposable
 
         try
         {
+            var roots = thread.EnumerateStackRoots()
+                .Select(CreateRootInfo)
+                .ToArray();
+
             return thread.EnumerateStackTrace()
                 .Take(64)
                 .Select(f => new ManagedStackFrameInfo(
                     Name: f.ToString() ?? "<unknown managed frame>",
+                    Kind: f.Kind.ToString(),
                     InstructionPointer: f.InstructionPointer,
-                    StackPointer: f.StackPointer))
+                    StackPointer: f.StackPointer,
+                    MethodDesc: f.Method?.MethodDesc ?? 0,
+                    MetadataToken: f.Method?.MetadataToken ?? 0,
+                    StackRoots: roots.Where(r => FrameMatchesRoot(f, r)).ToArray()))
                 .ToArray();
         }
         catch
         {
             return [];
         }
+    }
+
+    public async Task<ExecutionResult> ExecuteAsync(string command, int? threadId)
+    {
+        if (threadId is not null)
+        {
+            Reader.SelectThread((uint)threadId.Value);
+        }
+
+        var result = await _gdb.ExecuteAsync(command);
+        Reader.FlushCachedData();
+        RefreshRuntime();
+        return result with
+        {
+            ThreadId = result.GdbThreadId is { } gdbThreadId
+                ? Reader.GetOsThreadId(gdbThreadId) ?? result.ThreadId
+                : result.ThreadId,
+        };
+    }
+
+    private void RefreshRuntime()
+    {
+        _runtime?.Dispose();
+        _target.Dispose();
+        _target = new DataTarget(Reader, new DataTargetOptions());
+        _runtime = CreateRuntime(_target);
+        RefreshRuntimeSummary();
+    }
+
+    private void RefreshRuntimeSummary()
+    {
+        ClrVersionCount = _target.ClrVersions.Length;
+        HeapCanWalk = _runtime?.Heap.CanWalkHeap ?? false;
+        SystemStringMethodTable = _runtime?.Heap.GetTypeByName("System.String")?.MethodTable ?? 0;
+        ManagedThreads = _runtime?.Threads.Select((t, i) =>
+            new ManagedThreadInfo(
+                Id: t.OSThreadId == 0 ? i + 1 : checked((int)t.OSThreadId),
+                ManagedThreadId: checked((ulong)t.ManagedThreadId),
+                OSThreadId: t.OSThreadId,
+                Name: $"managed {t.ManagedThreadId} / os 0x{t.OSThreadId:x}")).ToArray() ?? [];
+    }
+
+    private static ClrRuntime? CreateRuntime(DataTarget target)
+    {
+        if (target.ClrVersions.Length == 0)
+        {
+            return null;
+        }
+
+        var clr = target.ClrVersions[0];
+        var dacPath = clr.DebuggingLibraries.Select(l => l.FileName).FirstOrDefault(File.Exists)
+            ?? "/usr/share/dotnet/shared/Microsoft.NETCore.App/10.0.8/libmscordaccore.so";
+        return clr.CreateRuntime(dacPath, ignoreMismatch: true);
+    }
+
+    private static bool FrameMatchesRoot(ClrStackFrame frame, ManagedStackRootInfo root)
+    {
+        if (root.InstructionPointer == frame.InstructionPointer && root.StackPointer == frame.StackPointer)
+        {
+            return true;
+        }
+
+        return frame.Kind == ClrStackFrameKind.Runtime && root.StackPointer == frame.StackPointer;
+    }
+
+    private static ManagedStackRootInfo CreateRootInfo(ClrStackRoot root)
+    {
+        var obj = root.Object;
+        return new ManagedStackRootInfo(
+            Address: root.Address,
+            ObjectAddress: obj.Address,
+            InstructionPointer: root.StackFrame?.InstructionPointer ?? 0,
+            StackPointer: root.StackFrame?.StackPointer ?? 0,
+            RegisterName: root.RegisterName,
+            RegisterOffset: root.RegisterOffset,
+            TypeName: obj.Type?.Name ?? "<unknown>",
+            DisplayValue: FormatObject(obj),
+            Fields: ReadObjectFields(obj));
+    }
+
+    private static IReadOnlyList<ManagedObjectFieldInfo> ReadObjectFields(ClrObject obj)
+    {
+        if (!obj.IsValid || obj.Type is null)
+        {
+            return [];
+        }
+
+        var fields = new List<ManagedObjectFieldInfo>
+        {
+            new("address", $"0x{obj.Address:x16}", "address"),
+            new("type", obj.Type.Name ?? "<unknown>", "string"),
+            new("size", obj.Size.ToString(CultureInfo.InvariantCulture), "ulong"),
+        };
+
+        foreach (var field in obj.Type.Fields.Take(24))
+        {
+            try
+            {
+                fields.Add(new ManagedObjectFieldInfo(
+                    field.Name ?? "<unnamed>",
+                    ReadFieldValue(obj, field),
+                    field.Type?.Name ?? field.ElementType.ToString()));
+            }
+            catch
+            {
+                fields.Add(new ManagedObjectFieldInfo(field.Name ?? "<unnamed>", "<unreadable>", field.ElementType.ToString()));
+            }
+        }
+
+        return fields;
+    }
+
+    private static string ReadFieldValue(ClrObject obj, ClrInstanceField field)
+        => field.ElementType switch
+        {
+            ClrElementType.Boolean => field.Read<bool>(obj.Address, interior: false).ToString(),
+            ClrElementType.Char => field.Read<char>(obj.Address, interior: false).ToString(),
+            ClrElementType.Int8 => field.Read<sbyte>(obj.Address, interior: false).ToString(CultureInfo.InvariantCulture),
+            ClrElementType.UInt8 => field.Read<byte>(obj.Address, interior: false).ToString(CultureInfo.InvariantCulture),
+            ClrElementType.Int16 => field.Read<short>(obj.Address, interior: false).ToString(CultureInfo.InvariantCulture),
+            ClrElementType.UInt16 => field.Read<ushort>(obj.Address, interior: false).ToString(CultureInfo.InvariantCulture),
+            ClrElementType.Int32 => field.Read<int>(obj.Address, interior: false).ToString(CultureInfo.InvariantCulture),
+            ClrElementType.UInt32 => field.Read<uint>(obj.Address, interior: false).ToString(CultureInfo.InvariantCulture),
+            ClrElementType.Int64 => field.Read<long>(obj.Address, interior: false).ToString(CultureInfo.InvariantCulture),
+            ClrElementType.UInt64 => field.Read<ulong>(obj.Address, interior: false).ToString(CultureInfo.InvariantCulture),
+            ClrElementType.NativeInt => $"0x{field.Read<nint>(obj.Address, interior: false).ToInt64():x}",
+            ClrElementType.NativeUInt => $"0x{field.Read<nuint>(obj.Address, interior: false).ToUInt64():x}",
+            ClrElementType.Float => field.Read<float>(obj.Address, interior: false).ToString(CultureInfo.InvariantCulture),
+            ClrElementType.Double => field.Read<double>(obj.Address, interior: false).ToString(CultureInfo.InvariantCulture),
+            ClrElementType.String => field.ReadString(obj.Address, interior: false) is { } s ? JsonSerializer.Serialize(s) : "null",
+            _ when field.IsObjectReference => FormatObject(field.ReadObject(obj.Address, interior: false)),
+            _ => $"0x{field.GetAddress(obj.Address):x16}",
+        };
+
+    private static string FormatObject(ClrObject obj)
+    {
+        if (obj.IsNull)
+        {
+            return "null";
+        }
+
+        if (!obj.IsValid)
+        {
+            return $"0x{obj.Address:x16} <invalid object>";
+        }
+
+        if (obj.Type?.IsString == true)
+        {
+            try
+            {
+                return $"{JsonSerializer.Serialize(obj.AsString(256))} @ 0x{obj.Address:x16}";
+            }
+            catch
+            {
+            }
+        }
+
+        return $"0x{obj.Address:x16} {obj.Type?.Name ?? "<unknown>"}";
     }
 
     public void Dispose()
@@ -446,7 +667,35 @@ internal sealed class RrInspectionSession : IDisposable
 
 internal sealed record ManagedThreadInfo(int Id, ulong ManagedThreadId, uint OSThreadId, string Name);
 
-internal sealed record ManagedStackFrameInfo(string Name, ulong InstructionPointer, ulong StackPointer);
+internal sealed record ManagedStackFrameInfo(
+    string Name,
+    string Kind,
+    ulong InstructionPointer,
+    ulong StackPointer,
+    ulong MethodDesc,
+    int MetadataToken,
+    IReadOnlyList<ManagedStackRootInfo> StackRoots);
+
+internal sealed record ManagedStackRootInfo(
+    ulong Address,
+    ulong ObjectAddress,
+    ulong InstructionPointer,
+    ulong StackPointer,
+    string? RegisterName,
+    int RegisterOffset,
+    string TypeName,
+    string DisplayValue,
+    IReadOnlyList<ManagedObjectFieldInfo> Fields);
+
+internal sealed record ManagedObjectFieldInfo(string Name, string Value, string TypeName);
+
+internal sealed record ExecutionResult(
+    bool Exited,
+    int? ExitCode,
+    bool HitBreakpoint,
+    int? ThreadId,
+    int? GdbThreadId,
+    string Description);
 
 internal sealed class RrReplaySession : IDisposable
 {
@@ -609,6 +858,56 @@ internal sealed class GdbMiClient : IDisposable
 
     public async Task<string> RawCommandAsync(string command) => await CommandAsync(command);
 
+    public async Task<ExecutionResult> ExecuteAsync(string command)
+    {
+        await _commandLock.WaitAsync();
+        try
+        {
+            var token = Interlocked.Increment(ref _token);
+            await _process.StandardInput.WriteLineAsync($"{token}{command}");
+            await _process.StandardInput.FlushAsync();
+
+            var timeout = DateTime.UtcNow.AddSeconds(30);
+            var accepted = false;
+            while (DateTime.UtcNow < timeout)
+            {
+                if (!TryTakeLine(timeout, out var line))
+                {
+                    continue;
+                }
+
+                if (!accepted)
+                {
+                    if (line.StartsWith($"{token}^error", StringComparison.Ordinal))
+                    {
+                        await WaitForPromptAsync();
+                        throw new InvalidOperationException(ExtractMiString(line, "msg=") ?? line);
+                    }
+
+                    if (line.StartsWith($"{token}^running", StringComparison.Ordinal)
+                        || line.StartsWith($"{token}^done", StringComparison.Ordinal))
+                    {
+                        accepted = true;
+                    }
+
+                    continue;
+                }
+
+                if (line.StartsWith("*stopped", StringComparison.Ordinal))
+                {
+                    await WaitForPromptAsync();
+                    return ParseStopped(line);
+                }
+            }
+
+            throw new TimeoutException($"gdb/mi execution command timed out: {command}");
+        }
+        finally
+        {
+            _commandLock.Release();
+        }
+    }
+
     public async Task<byte[]> ReadMemoryAsync(ulong address, int count)
     {
         var result = await CommandAsync($"-data-read-memory-bytes 0x{address:x} {count}");
@@ -732,6 +1031,24 @@ internal sealed class GdbMiClient : IDisposable
         var end = text.IndexOf('"', index);
         return end < 0 ? null : text[index..end];
     }
+
+    private static ExecutionResult ParseStopped(string line)
+    {
+        var reason = ExtractMiString(line, "reason=") ?? "stopped";
+        var exitCode = ExtractMiString(line, "exit-code=");
+        var threadId = ExtractMiString(line, "thread-id=");
+        return new ExecutionResult(
+            Exited: reason.StartsWith("exited", StringComparison.Ordinal),
+            ExitCode: exitCode is not null && int.TryParse(exitCode, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var parsedExitCode)
+                ? parsedExitCode
+                : null,
+            HitBreakpoint: reason.Contains("breakpoint", StringComparison.Ordinal),
+            ThreadId: null,
+            GdbThreadId: threadId is not null && int.TryParse(threadId, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedThreadId)
+                ? parsedThreadId
+                : null,
+            Description: reason);
+    }
 }
 
 internal sealed class RrGdbDataReader : IDataReader, IDisposable
@@ -760,6 +1077,27 @@ internal sealed class RrGdbDataReader : IDataReader, IDisposable
     public IReadOnlyList<Mapping> Mappings { get; }
 
     public IEnumerable<ModuleInfo> EnumerateModules() => Modules;
+    public void SelectThread(uint osThreadId)
+    {
+        if (_gdbThreadsByOsThread.TryGetValue(osThreadId, out var gdbThreadId))
+        {
+            _gdb.RawCommandAsync($"-thread-select {gdbThreadId}").GetAwaiter().GetResult();
+        }
+    }
+
+    public int? GetOsThreadId(int gdbThreadId)
+    {
+        foreach (var (osThreadId, id) in _gdbThreadsByOsThread)
+        {
+            if (id == gdbThreadId)
+            {
+                return checked((int)osThreadId);
+            }
+        }
+
+        return null;
+    }
+
     public bool GetThreadContext(uint threadID, uint contextFlags, Span<byte> context)
     {
         if (context.Length < AMD64Context.Size || !_gdbThreadsByOsThread.TryGetValue(threadID, out var gdbThreadId))

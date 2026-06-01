@@ -59,7 +59,7 @@ Current proof points:
 Current limitations:
 
 - Stack walking depends on GDB register reads for the rr replay thread context.
-- Managed local variables are not implemented yet. The DAP currently exposes frame metadata, not CLR local-variable values.
+- Source-level managed local names/slots are not implemented yet. The DAP currently exposes frame metadata and CLRMD stack GC roots for each frame.
 - Memory reads go through GDB/MI and are page-cached, but are still not optimized for broad heap scans.
 
 ## DAP adapter
@@ -95,12 +95,12 @@ Current DAP support:
 - `threads`
 - `stackTrace` with best-effort managed frames from CLRMD
 - `scopes`
-- `variables` with trace/runtime/module summary and per-frame method/IP/SP metadata
+- `variables` with trace/runtime/module summary, per-frame method/IP/SP metadata, and CLRMD stack roots
 - `setBreakpoints` returns unverified placeholders
-- `stepIn`, `next`, and `stepOut` acknowledge without moving the rr event
+- `continue`, `stepIn`, `next`, `stepOut`, `stepBack`, and `reverseContinue` route to rr through GDB/MI
 - `terminate`
 
-The adapter is currently a snapshot inspector, not an execution-control debugger. The next important steps are managed local-variable inspection and wiring rr event movement for continue/step/reverse-step.
+The adapter is still early, but execution requests now move the rr replay through GDB/MI. The next important steps are source breakpoint binding and true source-level local-variable inspection.
 
 ## VS Code extension
 
